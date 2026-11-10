@@ -1,101 +1,96 @@
 
 import os
 import sqlite3
+from threading import Thread
+
 import telebot
 from telebot import types
 from flask import Flask
-from threading import Thread
 
-TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "481978731"))
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+ADMIN_ID = int(os.environ["ADMIN_ID"])
 
-bot = telebot.TeleBot(TOKEN)
-db = sqlite3.connect("kino.db", check_same_thread=False)
-db.execute("CREATE TABLE IF NOT EXISTS movies (code TEXT PRIMARY KEY, file_id TEXT NOT NULL)")
-db.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY)")
-db.execute("""CREATE TABLE IF NOT EXISTS channels (
+bot = telebot.TeleBot(BOT_TOKEN)
+app = Flask(__name__)
+
+db = sqlite3.connect("kinohub.db", check_same_thread=False)
+db.execute("""
+CREATE TABLE IF NOT EXISTS movies (
+    code TEXT PRIMARY KEY,
+    file_id TEXT NOT NULL
+)
+""")
+db.execute("""
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY
+)
+""")
+db.execute("""
+CREATE TABLE IF NOT EXISTS channels (
     channel_id TEXT PRIMARY KEY,
     title TEXT,
-    link TEXT,
-    username TEXT
-)""")
+    link TEXT
+)
+""")
 db.commit()
 
-app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "KinoHub ishlayapti!"
+    return "KinoHub bot ishlayapti!"
+
 
 def run_web():
-    app.run(host="0.0.0.0", port=10000)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
 
-Thread(target=run_web, daemon=True).start()
-
-def is_admin(message):
-    return message.from_user.id == ADMIN_ID
 
 def admin_menu():
-    m = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    m.row("🎬 Kino qo‘shish", "🗑 Kino o‘chirish")
-    m.row("📋 Kinolar", "📢 Kanallar")
-    m.row("👥 Foydalanuvchilar", "📊 Statistika")
-    m.row("🔄 Panel")
-    return m
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.row("🎬 Kino qo‘shish", "🗑 Kino o‘chirish")
+    markup.row("📋 Kinolar ro‘yxati", "📊 Statistika")
+    markup.row("➕ Kanal qo‘shish", "➖ Kanal o‘chirish")
+    markup.row("📡 Kanallar ro‘yxati")
+    return markup
 
-def channel_menu():
-    m = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    m.row("➕ Kanal qo‘shish", "➖ Kanal o‘chirish")
-    m.row("📋 Kanallar ro‘yxati", "⬅️ Asosiy panel")
-    return m
 
-def subscribed(user_id):
-    rows = db.execute("SELECT channel_id FROM channels").fetchall()
-    for row in rows:
+def get_channels():
+    return db.execute(
+        "SELECT channel_id, title, link FROM channels"
+    ).fetchall()
+
+
+def check_subscriptions(user_id):
+    channels = get_channels()
+
+    for channel_id, title, link in channels:
         try:
-            status = bot.get_chat_member(row[0], user_id).status
-            if status not in ("member", "administrator", "creator"):
+            member = bot.get_chat_member(channel_id, user_id)
+            if member.status in ["left", "kicked"]:
+                return False
+            if member.status == "restricted" and not member.is_member:
                 return False
         except Exception:
             return False
+
     return True
 
-def ask_subscription(chat_id, code):
-    rows = db.execute(
-        "SELECT title, link FROM channels"
-    ).fetchall()
 
-    m = types.InlineKeyboardMarkup()
-    for title, link in rows:
-        m.add(types.InlineKeyboardButton(
-            "📢 " + title, url=link
+def subscription_markup():
+    markup = types.InlineKeyboardMarkup()
+    for channel_id, title, link in get_channels():
+        markup.add(types.InlineKeyboardButton(
+            text="📢 " + title,
+            url=link
         ))
-    m.add(types.InlineKeyboardButton(
-        "✅ Obunani tekshirish",
-        callback_data="check_" + code
+
+    markup.add(types.InlineKeyboardButton(
+        text="✅ Tekshirish",
+        callback_data="check_sub"
     ))
-    bot.send_message(
-        chat_id,
-        "🎬 Kinoni olish uchun quyidagi kanallarga obuna bo‘ling.\n"
-        "Yopiq kanal bo‘lsa, obuna uchun zayavka yuboring.",
-        reply_markup=m
-    )
+    return markup
 
-def send_movie(chat_id, code, user_id):
-    if not subscribed(user_id):
-        ask_subscription(chat_id, code)
-        return
 
-    row = db.execute(
-        "SELECT file_id FROM movies WHERE code=?", (code,)
-    ).fetchone()
-
-    if row:
-        bot.send_video(chat_id, row[0], caption="🎬 KinoHub")
-    else:
-        bot.send_message(chat_id, "❌ Bunday kino kodi topilmadi.")
-
-@bot.message_handler(commands=["start", "panel"])
+@bot.message_handler(commands=["start"])
 def start(message):
     db.execute(
         "INSERT OR IGNORE INTO users VALUES (?)",
@@ -103,278 +98,400 @@ def start(message):
     )
     db.commit()
 
-    if is_admin(message):
+    if message.from_user.id == ADMIN_ID:
         bot.send_message(
             message.chat.id,
-            "👑 KinoHub boshqaruv paneli",
+            "👑 KinoHub Admin Panel",
+            reply_markup=admin_menu()
+        )
+        return
+
+    if not check_subscriptions(message.from_user.id):
+        bot.send_message(
+            message.chat.id,
+            "Botdan foydalanish uchun quyidagi kanallarga obuna bo‘ling:",
+            reply_markup=subscription_markup()
+        )
+        return
+
+    bot.send_message(
+        message.chat.id,
+        "🎬 KinoHub botiga xush kelibsiz!\nKino kodini yuboring."
+    )
+
+
+@bot.message_handler(commands=["admin"])
+def admin_command(message):
+    if message.from_user.id == ADMIN_ID:
+        bot.send_message(
+            message.chat.id,
+            "👑 Admin Panel",
+            reply_markup=admin_menu()
+        )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "check_sub")
+def check_sub_callback(call):
+    if check_subscriptions(call.from_user.id):
+        bot.answer_callback_query(call.id, "Obuna tasdiqlandi!")
+        bot.send_message(
+            call.message.chat.id,
+            "✅ Obuna tasdiqlandi!\nKino kodini yuboring."
+        )
+    else:
+        bot.answer_callback_query(
+            call.id,
+            "Avval barcha kanallarga obuna bo‘ling!",
+            show_alert=True
+        )
+
+
+# KINO QO‘SHISH
+
+@bot.message_handler(func=lambda m: m.text == "🎬 Kino qo‘shish")
+def add_start(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    msg = bot.send_message(
+        message.chat.id,
+        "Kino kodini yuboring:"
+    )
+    bot.register_next_step_handler(msg, get_code)
+
+
+def get_code(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    code = message.text.strip()
+    msg = bot.send_message(
+        message.chat.id,
+        "Endi kino videosini yuboring:"
+    )
+    bot.register_next_step_handler(msg, save_video, code)
+
+
+def save_video(message, code):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    if message.content_type == "video":
+        db.execute(
+            "INSERT OR REPLACE INTO movies VALUES (?, ?)",
+            (code, message.video.file_id)
+        )
+        db.commit()
+
+        bot.send_message(
+            message.chat.id,
+            "✅ Kino saqlandi!",
             reply_markup=admin_menu()
         )
     else:
         bot.send_message(
             message.chat.id,
-            "🎬 KinoHub botiga xush kelibsiz!\n\nKino kodini yuboring."
+            "❌ Video yuboring. Qaytadan boshlash uchun Kino qo‘shish tugmasini bosing."
         )
 
-@bot.message_handler(func=lambda m: m.text == "🔄 Panel")
-def panel(message):
-    if is_admin(message):
-        bot.send_message(message.chat.id, "Admin panel:", reply_markup=admin_menu())
-
-@bot.message_handler(func=lambda m: m.text == "⬅️ Asosiy panel")
-def back_panel(message):
-    if is_admin(message):
-        bot.send_message(message.chat.id, "Asosiy panel:", reply_markup=admin_menu())
-
-# KINO QO‘SHISH
-@bot.message_handler(func=lambda m: m.text == "🎬 Kino qo‘shish")
-def add_movie_start(message):
-    if not is_admin(message):
-        return
-    msg = bot.send_message(message.chat.id, "Kino kodini yuboring:")
-    bot.register_next_step_handler(msg, get_movie_code)
-
-def get_movie_code(message):
-    if not is_admin(message):
-        return
-    code = message.text.strip()
-    msg = bot.send_message(message.chat.id, "Endi kino videosini yuboring:")
-    bot.register_next_step_handler(msg, save_movie, code)
-
-def save_movie(message, code):
-    if not is_admin(message):
-        return
-    if not message.video:
-        bot.send_message(message.chat.id, "❌ Video yuboring.", reply_markup=admin_menu())
-        return
-    db.execute(
-        "INSERT OR REPLACE INTO movies VALUES (?, ?)",
-        (code, message.video.file_id)
-    )
-    db.commit()
-    bot.send_message(
-        message.chat.id, "✅ Kino saqlandi!",
-        reply_markup=admin_menu()
-    )
-
-# KINO O‘CHIRISH
-@bot.message_handler(func=lambda m: m.text == "🗑 Kino o‘chirish")
-def delete_start(message):
-    if not is_admin(message):
-        return
-    msg = bot.send_message(message.chat.id, "O‘chiriladigan kino kodini yuboring:")
-    bot.register_next_step_handler(msg, delete_movie)
-
-def delete_movie(message):
-    if not is_admin(message):
-        return
-    cur = db.execute("DELETE FROM movies WHERE code=?", (message.text.strip(),))
-    db.commit()
-    answer = "✅ Kino o‘chirildi!" if cur.rowcount else "❌ Kino topilmadi."
-    bot.send_message(message.chat.id, answer, reply_markup=admin_menu())
 
 # KINOLAR RO‘YXATI
-@bot.message_handler(func=lambda m: m.text == "📋 Kinolar")
+
+@bot.message_handler(func=lambda m: m.text == "📋 Kinolar ro‘yxati")
 def movie_list(message):
-    if not is_admin(message):
+    if message.from_user.id != ADMIN_ID:
         return
-    rows = db.execute("SELECT code FROM movies ORDER BY code").fetchall()
+
+    rows = db.execute(
+        "SELECT code FROM movies ORDER BY code"
+    ).fetchall()
+
     if not rows:
-        bot.send_message(message.chat.id, "Hozircha kino yo‘q.")
+        bot.send_message(message.chat.id, "Hozircha kinolar yo‘q.")
         return
-    result = "\n".join("🎬 " + r[0] for r in rows)
-    bot.send_message(message.chat.id, "Kinolar ro‘yxati:\n\n" + result[:4000])
 
-# KANAL MENYUSI
-@bot.message_handler(func=lambda m: m.text == "📢 Kanallar")
-def channels_menu(message):
-    if is_admin(message):
-        bot.send_message(message.chat.id, "📢 Kanal boshqaruvi:", reply_markup=channel_menu())
+    result = "\n".join("🎬 " + row[0] for row in rows)
+    bot.send_message(message.chat.id, "Kinolar:\n" + result)
 
-@bot.message_handler(func=lambda m: m.text == "➕ Kanal qo‘shish")
-def add_channel_start(message):
-    if not is_admin(message):
+
+# KINO O‘CHIRISH
+
+@bot.message_handler(func=lambda m: m.text == "🗑 Kino o‘chirish")
+def delete_start(message):
+    if message.from_user.id != ADMIN_ID:
         return
+
     msg = bot.send_message(
         message.chat.id,
-        "Kanal username yoki ID sini yuboring.\n\n"
-        "Ochiq kanal: @kanal_nomi\n"
-        "Yopiq kanal: -100 bilan boshlanadigan ID"
+        "O‘chiriladigan kino kodini yuboring:"
     )
-    bot.register_next_step_handler(msg, add_channel)
+    bot.register_next_step_handler(msg, delete_movie)
 
-def add_channel(message):
-    if not is_admin(message):
+
+def delete_movie(message):
+    if message.from_user.id != ADMIN_ID:
         return
-    ref = message.text.strip()
+
+    code = message.text.strip()
+    cur = db.execute(
+        "DELETE FROM movies WHERE code=?",
+        (code,)
+    )
+    db.commit()
+
+    if cur.rowcount:
+        bot.send_message(message.chat.id, "✅ Kino o‘chirildi!")
+    else:
+        bot.send_message(message.chat.id, "❌ Bunday kod topilmadi!")
+
+
+# STATISTIKA
+
+@bot.message_handler(func=lambda m: m.text == "📊 Statistika")
+def statistics(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    users = db.execute(
+        "SELECT COUNT(*) FROM users"
+    ).fetchone()[0]
+
+    movies = db.execute(
+        "SELECT COUNT(*) FROM movies"
+    ).fetchone()[0]
+
+    channels = db.execute(
+        "SELECT COUNT(*) FROM channels"
+    ).fetchone()[0]
+
+    bot.send_message(
+        message.chat.id,
+        f"📊 Statistika\n\n"
+        f"👥 Foydalanuvchilar: {users}\n"
+        f"🎬 Kinolar: {movies}\n"
+        f"📢 Kanallar: {channels}"
+    )
+
+
+# KANAL QO‘SHISH
+
+@bot.message_handler(func=lambda m: m.text == "➕ Kanal qo‘shish")
+def channel_add_start(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    msg = bot.send_message(
+        message.chat.id,
+        "Kanal username yoki ID sini yuboring.\n"
+        "Masalan: @kanal_nomi yoki -1001234567890"
+    )
+    bot.register_next_step_handler(msg, channel_add)
+
+
+def channel_add(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    value = message.text.strip()
+
     try:
-        chat = bot.get_chat(ref)
-        channel_id = str(chat.id)
-        title = chat.title or ref
-        username = chat.username or ""
-        if username:
-            link = "https://t.me/" + username
+        chat = bot.get_chat(value)
+
+        if chat.username:
+            link = "https://t.me/" + chat.username
         else:
             invite = bot.create_chat_invite_link(
-                chat.id, creates_join_request=True
+                chat.id,
+                creates_join_request=True
             )
             link = invite.invite_link
 
+        title = chat.title or value
+
         db.execute(
-            "INSERT OR REPLACE INTO channels VALUES (?, ?, ?, ?)",
-            (channel_id, title, link, username)
+            "INSERT OR REPLACE INTO channels VALUES (?, ?, ?)",
+            (str(chat.id), title, link)
         )
         db.commit()
+
         bot.send_message(
             message.chat.id,
             "✅ Kanal qo‘shildi!\n"
-            "Nomi: " + title + "\n"
-            "Havola: " + link,
-            reply_markup=channel_menu()
+            f"📢 {title}\n"
+            f"🔗 {link}",
+            reply_markup=admin_menu()
         )
+
     except Exception as e:
         bot.send_message(
             message.chat.id,
             "❌ Kanal qo‘shilmadi.\n"
-            "Botni kanalga administrator qiling va ID yoki username ni tekshiring.\n"
-            "Xato: " + str(e)[:500],
-            reply_markup=channel_menu()
+            "Botni kanalga administrator qiling va qayta urinib ko‘ring.\n\n"
+            f"Xato: {e}"
         )
+
 
 # KANAL O‘CHIRISH
-@bot.message_handler(func=lambda m: m.text == "➖ Kanal o‘chirish")
-def remove_channel_start(message):
-    if not is_admin(message):
-        return
-    msg = bot.send_message(message.chat.id, "O‘chiriladigan kanal ID sini yuboring:")
-    bot.register_next_step_handler(msg, remove_channel)
 
-def remove_channel(message):
-    if not is_admin(message):
+@bot.message_handler(func=lambda m: m.text == "➖ Kanal o‘chirish")
+def channel_delete_start(message):
+    if message.from_user.id != ADMIN_ID:
         return
+
+    msg = bot.send_message(
+        message.chat.id,
+        "O‘chiriladigan kanal ID sini yuboring:"
+    )
+    bot.register_next_step_handler(msg, channel_delete)
+
+
+def channel_delete(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    value = message.text.strip()
+
     cur = db.execute(
         "DELETE FROM channels WHERE channel_id=?",
-        (message.text.strip(),)
+        (value,)
     )
     db.commit()
-    answer = "✅ Kanal o‘chirildi!" if cur.rowcount else "❌ Kanal topilmadi."
-    bot.send_message(message.chat.id, answer, reply_markup=channel_menu())
+
+    if cur.rowcount:
+        bot.send_message(message.chat.id, "✅ Kanal o‘chirildi!")
+    else:
+        bot.send_message(message.chat.id, "❌ Bunday kanal topilmadi!")
+
 
 # KANALLAR RO‘YXATI
-@bot.message_handler(func=lambda m: m.text == "📋 Kanallar ro‘yxati")
-def channel_list(message):
-    if not is_admin(message):
-        return
-    rows = db.execute(
-        "SELECT channel_id, title, link FROM channels"
-    ).fetchall()
-    if not rows:
-        bot.send_message(message.chat.id, "Hozircha kanal qo‘shilmagan.")
-        return
-    for cid, title, link in rows:
-        bot.send_message(
-            message.chat.id,
-            f"📢 {title}\nID: {cid}\nHavola: {link}"
-        )
 
-# ZAYAVKALARNI ADMIN TASDIQLAYDI
+@bot.message_handler(func=lambda m: m.text == "📡 Kanallar ro‘yxati")
+def channel_list(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    rows = get_channels()
+
+    if not rows:
+        bot.send_message(message.chat.id, "Hozircha kanallar yo‘q.")
+        return
+
+    result = "\n".join(
+        f"📢 {title}\n🆔 {channel_id}\n"
+        for channel_id, title, link in rows
+    )
+    bot.send_message(message.chat.id, result)
+
+
+# YOPIQ KANAL ZAYAVKASI
+
 @bot.chat_join_request_handler(func=lambda request: True)
-def join_request(request):
-    user = request.from_user
-    chat = request.chat
-    m = types.InlineKeyboardMarkup()
-    m.row(
+def join_request_handler(request):
+    user_id = request.from_user.id
+    chat_id = request.chat.id
+
+    markup = types.InlineKeyboardMarkup()
+    markup.row(
         types.InlineKeyboardButton(
             "✅ Tasdiqlash",
-            callback_data=f"approve:{chat.id}:{user.id}"
+            callback_data=f"approve:{chat_id}:{user_id}"
         ),
         types.InlineKeyboardButton(
             "❌ Rad etish",
-            callback_data=f"decline:{chat.id}:{user.id}"
+            callback_data=f"decline:{chat_id}:{user_id}"
         )
     )
-    bot.send_message(
-        ADMIN_ID,
-        f"📩 Yangi zayavka!\n"
-        f"Foydalanuvchi: {user.first_name}\n"
-        f"ID: {user.id}\n"
-        f"Kanal: {chat.title}",
-        reply_markup=m
-    )
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith(("approve:", "decline:")))
-def manage_request(call):
+    try:
+        bot.send_message(
+            ADMIN_ID,
+            f"📩 Yangi zayavka!\n"
+            f"👤 {request.from_user.first_name}\n"
+            f"🆔 {user_id}",
+            reply_markup=markup
+        )
+        bot.send_message(
+            user_id,
+            "📩 Zayavkangiz yuborildi. Admin tasdiqlashini kuting."
+        )
+    except Exception:
+        pass
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith(("approve:", "decline:"))
+)
+def join_request_decision(call):
     if call.from_user.id != ADMIN_ID:
-        bot.answer_callback_query(call.id, "Bu amal faqat admin uchun.")
+        bot.answer_callback_query(call.id, "Ruxsat yo‘q!")
         return
-    action, channel_id, user_id = call.data.split(":")
+
+    action, chat_id, user_id = call.data.split(":")
+    chat_id = int(chat_id)
+    user_id = int(user_id)
+
     try:
         if action == "approve":
-            bot.approve_chat_join_request(int(channel_id), int(user_id))
-            answer = "✅ Zayavka tasdiqlandi."
+            bot.approve_chat_join_request(chat_id, user_id)
+            bot.answer_callback_query(call.id, "Zayavka tasdiqlandi!")
+            bot.send_message(user_id, "✅ Zayavkangiz tasdiqlandi!")
+            bot.edit_message_text(
+                "✅ Zayavka tasdiqlandi.",
+                call.message.chat.id,
+                call.message.message_id
+            )
         else:
-            bot.decline_chat_join_request(int(channel_id), int(user_id))
-            answer = "❌ Zayavka rad etildi."
-        bot.answer_callback_query(call.id, answer)
-        bot.edit_message_reply_markup(
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=None
-        )
+            bot.decline_chat_join_request(chat_id, user_id)
+            bot.answer_callback_query(call.id, "Zayavka rad etildi!")
+            bot.send_message(user_id, "❌ Zayavkangiz rad etildi.")
+            bot.edit_message_text(
+                "❌ Zayavka rad etildi.",
+                call.message.chat.id,
+                call.message.message_id
+            )
     except Exception as e:
-        bot.answer_callback_query(call.id, "Xato: " + str(e)[:150], show_alert=True)
+        bot.answer_callback_query(call.id, "Xatolik yuz berdi!")
+        bot.send_message(ADMIN_ID, f"Xato: {e}")
 
-# OBUNANI TEKSHIRISH
-@bot.callback_query_handler(func=lambda c: c.data.startswith("check_"))
-def check_subscription(call):
-    code = call.data[6:]
-    if subscribed(call.from_user.id):
-        bot.answer_callback_query(call.id, "✅ Obuna tasdiqlandi!")
-        send_movie(call.message.chat.id, code, call.from_user.id)
+
+# FOYDALANUVCHI KINO KODI YUBORGANDA
+
+@bot.message_handler(content_types=["text"])
+def get_movie(message):
+    if message.from_user.id == ADMIN_ID:
+        return
+
+    if not check_subscriptions(message.from_user.id):
+        bot.send_message(
+            message.chat.id,
+            "Avval kanallarga obuna bo‘ling:",
+            reply_markup=subscription_markup()
+        )
+        return
+
+    code = message.text.strip()
+
+    row = db.execute(
+        "SELECT file_id FROM movies WHERE code=?",
+        (code,)
+    ).fetchone()
+
+    if row:
+        bot.send_video(
+            message.chat.id,
+            row[0],
+            caption="🎬 KinoHub"
+        )
     else:
-        bot.answer_callback_query(
-            call.id,
-            "Avval barcha kanallarga obuna bo‘ling yoki zayavka yuboring.",
-            show_alert=True
+        bot.send_message(
+            message.chat.id,
+            "❌ Bunday kino kodi topilmadi."
         )
 
-# STATISTIKA
-@bot.message_handler(func=lambda m: m.text == "👥 Foydalanuvchilar")
-def users_count(message):
-    if not is_admin(message):
-        return
-    count = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-    bot.send_message(message.chat.id, f"👥 Foydalanuvchilar: {count}")
 
-@bot.message_handler(func=lambda m: m.text == "📊 Statistika")
-def stats(message):
-    if not is_admin(message):
-        return
-    users = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-    movies = db.execute("SELECT COUNT(*) FROM movies").fetchone()[0]
-    channels = db.execute("SELECT COUNT(*) FROM channels").fetchone()[0]
-    bot.send_message(
-        message.chat.id,
-        f"📊 KinoHub statistikasi\n\n"
-        f"👥 Foydalanuvchilar: {users}\n"
-        f"🎬 Kinolar: {movies}\n"
-        f"📢 Kanallar: {channels}",
-        reply_markup=admin_menu()
+if __name__ == "__main__":
+    Thread(target=run_web, daemon=True).start()
+    bot.infinity_polling(
+        skip_pending=True,
+        allowed_updates=["message", "callback_query", "chat_join_request"]
     )
-
-# FOYDALANUVCHI KINO KODI YUBORADI
-@bot.message_handler(content_types=["text"])
-def user_movie(message):
-    if is_admin(message):
-        return
-    db.execute(
-        "INSERT OR IGNORE INTO users VALUES (?)",
-        (message.from_user.id,)
-    )
-    db.commit()
-    send_movie(
-        message.chat.id,
-        message.text.strip(),
-        message.from_user.id
-    )
-
-bot.infinity_polling(skip_pending=True)
