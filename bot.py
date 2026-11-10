@@ -105,4 +105,18 @@ def save_video(message, code):
     else:
         bot.send_message(message.chat.id, "Video yuboring.")
 
+from flask import Flask
+from threading import Thread
+
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "KinoHub ishlayapti!"
+
+def run():
+    app.run(host='0.0.0.0', port=10000)
+
+Thread(target=run).start()
+
 bot.infinity_polling(skip_pending=True)
